@@ -6,11 +6,9 @@ import os
 import unicodedata
 from collections import defaultdict
 
-# 환경변수에서 OC 불러오기
 OC = os.getenv("OC", "chetera")
 BASE = "http://www.law.go.kr"
 
-# 법령목록 가져오기
 def get_law_list_from_api(query):
     exact_query = f'"{query}"'
     encoded_query = quote(exact_query)
@@ -23,74 +21,186 @@ def get_law_list_from_api(query):
         if res.status_code != 200:
             break
         root = ET.fromstring(res.content)
-        law_elements = root.findall("law")
-        if not law_elements:
-            break
-        for law_elem in law_elements:
-            law_name = law_elem.findtext("법령명한글")
-            mst = law_elem.findtext("법령일련번호")
-            link = law_elem.findtext("법령상세링크")
+        for law in root.findall("law"):
             laws.append({
-                "법령명": law_name,
-                "법령일련번호": mst,
-                "법령상세링크": link
+                "법령명": law.findtext("법령명한글", "").strip(),
+                "MST": law.findtext("법령일련번호", "")
             })
+        total_count = int(root.findtext("totalCnt", "0"))
+        if len(laws) >= total_count:
+            break
         page += 1
     return laws
 
-# 법령 본문 가져오기
-def get_law_content(mst):
-    url = f"{BASE}/DRF/lawService.do?OC={OC}&target=law&type=XML&mst={mst}"
-    res = requests.get(url, timeout=10)
-    res.encoding = 'utf-8'
-    if res.status_code != 200:
+def get_law_text_by_mst(mst):
+    url = f"{BASE}/DRF/lawService.do?OC={OC}&target=law&MST={mst}&type=XML"
+    try:
+        res = requests.get(url, timeout=10)
+        res.encoding = 'utf-8'
+        return res.content if res.status_code == 200 else None
+    except:
         return None
-    return ET.fromstring(res.content)
 
-# 검색어 포함 조문 탐색
-def find_articles_with_query(root, query):
-    results = []
-    for jo in root.findall(".//조문"):
-        jo_title = jo.findtext("조문제목") or ""
-        jo_text = jo.findtext("조문내용") or ""
+def clean(text):
+    return re.sub(r"\s+", "", text or "")
 
-        matches = []
+def 조사_을를(word):
+    if not word:
+        return "을"
+    code = ord(word[-1]) - 0xAC00
+    jong = code % 28
+    return "를" if jong == 0 else "을"
 
-        if query in jo_title or query in jo_text:
-            matches.append(jo_title + " " + jo_text)
+def 조사_으로로(word):
+    if not word:
+        return "으로"
+    code = ord(word[-1]) - 0xAC00
+    jong = code % 28
+    return "로" if jong == 0 or jong == 8 else "으로"
 
-        for hang in jo.findall(".//항"):
-            hang_text = hang.findtext("항내용") or ""
-            if query in hang_text:
-                matches.append(hang_text)
-            for ho in hang.findall(".//호"):
-                ho_text = ho.findtext("호내용") or ""
-                if query in ho_text:
-                    matches.append(ho_text)
-                for mok in ho.findall(".//목"):
-                    mok_text = mok.findtext("목내용") or ""
-                    if query in mok_text:
-                        matches.append(mok_text)
+def highlight(text, keyword):
+    return text.replace(keyword, f"<span style='color:red'>{keyword}</span>") if text else ""
 
-        if matches:
-            results.append({
-                "조문제목": jo_title,
-                "조문내용": jo_text,
-                "포함항목": matches
-            })
-    return results
+def remove_unicode_number_prefix(text):
+    return re.sub(r"^[①-⑳]+", "", text)
 
-# 개정문 생성
-def generate_amendment(law_name, query, replace_word, articles):
-    targets = []
+def normalize_number(text):
+    try:
+        return str(int(unicodedata.numeric(text)))
+    except:
+        return text
+
+def make_article_number(조문번호, 조문가지번호):
+    if 조문가지번호 and 조문가지번호 != "0":
+        return f"제{조문번호}조의{조문가지번호}"
+    else:
+        return f"제{조문번호}조"
+
+def extract_chunks(text, keyword):
+    match = re.search(rf"(\w*{keyword}\w*)", text)
+    return match.group(1) if match else None
+
+def extract_locations(xml_data, keyword):
+    tree = ET.fromstring(xml_data)
+    articles = tree.findall(".//조문단위")
+    keyword_clean = clean(keyword)
+    locations = []
+
     for article in articles:
-        for content in article["포함항목"]:
-            targets.append(content)
-    if not targets:
-        return ""
+        조번호 = article.findtext("조문번호", "").strip()
+        조가지번호 = article.findtext("조문가지번호", "").strip()
+        조제목 = article.findtext("조문제목", "") or ""
+        조내용 = article.findtext("조문내용", "") or ""
 
-    unique_targets = list(set(targets))
-    full_target_desc = ", ".join(unique_targets)
+        조식별 = make_article_number(조번호, 조가지번호)
 
-    amendment = f"{law_name} 중 \"{query}\"를 \"{replace_word}\"로 한다."
-    return amendment
+        if keyword_clean in clean(조제목):
+            locations.append((조식별, None, None, None, 조제목.strip()))
+        if keyword_clean in clean(조내용):
+            locations.append((조식별, None, None, None, 조내용.strip()))
+
+        for 항 in article.findall("항"):
+            항번호 = normalize_number(항.findtext("항번호", "").strip())
+            항내용 = 항.findtext("항내용") or ""
+            has_항번호 = 항번호.isdigit()
+            if keyword_clean in clean(항내용) and has_항번호:
+                locations.append((조식별, 항번호, None, None, 항내용.strip()))
+            for 호 in 항.findall("호"):
+                호번호 = normalize_number(호.findtext("호번호", "").strip())
+                호내용 = 호.findtext("호내용") or ""
+                if keyword_clean in clean(호내용):
+                    locations.append((조식별, 항번호, 호번호, None, 호내용.strip()))
+                for 목 in 호.findall("목"):
+                    목번호 = normalize_number(목.findtext("목번호", "").strip())
+                    목내용 = 목.findtext("목내용") or ""
+                    if keyword_clean in clean(목내용):
+                        locations.append((조식별, 항번호, 호번호, 목번호, 목내용.strip()))
+    return locations
+
+def format_location(loc):
+    조, 항, 호, 목, 텍스트 = loc
+    if 목:
+        return f"{조}제{항}항제{호}호제{목}목"
+    elif 호:
+        return f"{조}제{항}항제{호}호"
+    elif 항:
+        return f"{조}제{항}항"
+    else:
+        return f"{조}"
+
+def run_search_logic(query, unit):
+    result_dict = {}
+    keyword_clean = clean(query)
+
+    for law in get_law_list_from_api(query):
+        mst = law["MST"]
+        xml_data = get_law_text_by_mst(mst)
+        if not xml_data:
+            continue
+
+        tree = ET.fromstring(xml_data)
+        articles = tree.findall(".//조문단위")
+        law_results = []
+
+        for article in articles:
+            조내용 = article.findtext("조문내용") or ""
+            항들 = article.findall("항")
+            출력덩어리 = []
+            첫_항출력됨 = False
+
+            조출력 = keyword_clean in clean(조내용)
+            if 조출력:
+                출력덩어리.append(highlight(조내용, query))
+
+            for 항 in 항들:
+                항내용 = 항.findtext("항내용") or ""
+                항내용 = remove_unicode_number_prefix(항내용.strip())
+                항출력 = keyword_clean in clean(항내용)
+
+                if 항출력:
+                    출력덩어리.append(highlight(항내용, query))
+
+            if 출력덩어리:
+                law_results.append("<br>".join(출력덩어리))
+
+        if law_results:
+            result_dict[law["법령명"]] = law_results
+
+    return result_dict
+
+def run_amendment_logic(find_word, replace_word):
+    을를 = 조사_을를(find_word)
+    으로로 = 조사_으로로(replace_word)
+    amendment_results = []
+
+    for idx, law in enumerate(get_law_list_from_api(find_word)):
+        law_name = law["법령명"]
+        mst = law["MST"]
+        xml = get_law_text_by_mst(mst)
+        if not xml:
+            continue
+
+        locations = extract_locations(xml, find_word)
+        if not locations:
+            continue
+
+        문장들 = []
+        덩어리별 = defaultdict(list)
+
+        for loc in locations:
+            조, 항, 호, 목, 텍스트 = loc
+            덩어리 = extract_chunks(텍스트, find_word)
+            if 덩어리:
+                덩어리별[덩어리].append(loc)
+
+        for chunk, locs in 덩어리별.items():
+            각각 = "각각 " if len(locs) > 1 else ""
+            loc_str = ", ".join([format_location(l) for l in locs[:-1]]) + (" 및 " if len(locs) > 1 else "") + format_location(locs[-1])
+            new_chunk = chunk.replace(find_word, replace_word)
+            문장들.append(f"{loc_str} 중 “{chunk}”{을를} {각각}“{new_chunk}”{으로로} 한다.")
+
+        if 문장들:
+            amendment = f"{chr(9311 + len(amendment_results) + 1)} {law_name} 일부를 다음과 같이 개정한다.<br>" + "<br>".join(문장들)
+            amendment_results.append(amendment)
+
+    return amendment_results if amendment_results else ["⚠️ 개정 대상 조문이 없습니다."]
